@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 
 # Source voltage
 STARTING_VOLTAGE = 5.0
@@ -29,35 +30,51 @@ def main():
 
     # Create a new dataframe to store the resistor combinations
     resistor_combos = np.array(
-        [(r1, r2, 1, STARTING_VOLTAGE * r2 / (r1 + r2), 0, 0) for r1 in resistors_scaled for r2 in resistors_scaled],
+        [
+            (
+                r1,
+                r2,
+                1,
+                STARTING_VOLTAGE * r2 / (r1 + r2),
+                0,
+                STARTING_VOLTAGE / (r1 + r2),
+                0,
+            )
+            for r1 in resistors_scaled
+            for r2 in resistors_scaled
+        ],
         dtype=[
             ("R1", int),
             ("R2", int),
-            ("Common Mult", int),
+            ("Mult", int),
             ("Output Voltage", float),
             ("Percent Error", float),
+            ("Current", float),
             ("Power Dissipation", float),
         ],
     )
-    # Simplify R1 and R2 to the same common multiplier
+    # Simplify R1 and R2 to the same Multiplier
     for combo in resistor_combos:
         lowest_resistor = min(combo["R1"], combo["R2"])
-        combo["Common Mult"] = int(np.log10(lowest_resistor)) - 1
-        combo["R1"] /= 10**combo["Common Mult"]
-        combo["R2"] /= 10**combo["Common Mult"]
+        # If <=E24, drop to 2 digits. Otherwise, keep 3 digits.
+        num_digits = 2 if RESISTOR_E_SERIES <= 24 else 3
+        common_mult = 10 ** (int(np.log10(lowest_resistor)) - num_digits + 1)
+        combo["Mult"] = common_mult
+        combo["R1"] /= common_mult
+        combo["R2"] /= common_mult
 
     # Calculate the percent error for each combination
     for combo in resistor_combos:
-        # Calculate values
-        r1 = combo["R1"] * 10**combo["Common Mult"]
-        r2 = combo["R2"] * 10**combo["Common Mult"]
-        percent_error = abs((combo["Output Voltage"] - TARGET_VOLTAGE) / TARGET_VOLTAGE) * 100
-        r1_voltage_drop = STARTING_VOLTAGE - combo["Output Voltage"]
-        r1_power_dissipation = (r1_voltage_drop**2) / r1
-        r2_power_dissipation = (combo["Output Voltage"]**2) / r2
-        max_power_dissipation = max(r1_power_dissipation, r2_power_dissipation)
-        # Insert into dataframe
+        # Calculate the percent error
+        percent_error = (
+            abs((combo["Output Voltage"] - TARGET_VOLTAGE) / TARGET_VOLTAGE) * 100
+        )
         combo["Percent Error"] = percent_error
+        # Calculate power dissipation for R1 and R2
+        r1_voltage_drop = STARTING_VOLTAGE - combo["Output Voltage"]
+        r1_power_dissipation = r1_voltage_drop * combo["Current"]
+        r2_power_dissipation = combo["Output Voltage"] * combo["Current"]
+        max_power_dissipation = max(r1_power_dissipation, r2_power_dissipation)
         combo["Power Dissipation"] = max_power_dissipation
 
     # Filter out combinations that exceed max power dissipation or have too high percent error
@@ -65,30 +82,52 @@ def main():
         resistor_combos["Power Dissipation"] <= MAX_RESISTOR_HEAT,
     ]
     max_allowable_error = (resistors[1] / resistors[0] - 1) * 100
-    print(
-        f"Max allowable error for E{RESISTOR_E_SERIES} series: {max_allowable_error:.1f}%"
-    )
     valid_combos = valid_combos[valid_combos["Percent Error"] <= max_allowable_error]
     # Sort the valid combinations
     valid_combos = np.sort(
         valid_combos,
-        order=["Percent Error", "Output Voltage", "R1", "R2", "Common Mult"],
+        order=["Percent Error", "Output Voltage", "R1", "R2", "Mult"],
+    )
+    # Remove duplicates based on R1 and R2
+    # This ensures we don't have the same resistor values with different Multipliers
+    # We keep the first occurrence (lowest Multiplier)
+    dt = np.dtype([("R1", valid_combos.dtype["R1"]), ("R2", valid_combos.dtype["R2"])])
+    temp_r1_r2_array = np.vstack((valid_combos["R1"], valid_combos["R2"])).T
+    R1_R2_view = np.ascontiguousarray(temp_r1_r2_array).view(dt).reshape(-1)
+    _, unique_indices = np.unique(R1_R2_view, return_index=True)
+    unique_R1_R2 = valid_combos[unique_indices]
+    # Resort the unique combinations
+    unique_R1_R2 = np.sort(
+        unique_R1_R2,
+        order=["Percent Error", "Output Voltage", "R1", "R2", "Mult"],
     )
 
-    # Print the valid combinations
+    # Format everything into a DataFrame for better readability
+    df = pd.DataFrame(unique_R1_R2)
+    df_display = df.copy()
+    df_display["R1"] = df_display["R1"].apply(lambda x: f"{x} Ω")
+    df_display["R2"] = df_display["R2"].apply(lambda x: f" {x} Ω")
+    df_display["Mult"] = df_display["Mult"].apply(lambda x: f" x{x}")
+    df_display["Output Voltage"] = df_display["Output Voltage"].apply(
+        lambda x: f" {x:.3f} V"
+    )
+    df_display["Percent Error"] = df_display["Percent Error"].apply(
+        lambda x: f" {x:.3f}%"
+    )
+    df_display["Current"] = df_display["Current"].apply(lambda x: f" {x * 1000:.3f} mA")
+    df_display["Power Dissipation"] = df_display["Power Dissipation"].apply(
+        lambda x: f" {x:.3f} W"
+    )
+    # Add an extra space before column names for better readability
+    for col in df_display.columns[1:]:
+        df_display.rename(columns={col: " " + col}, inplace=True)
+
+    # Print the results
+    print(f"Starting Voltage: {STARTING_VOLTAGE} V")
+    print(f"Target Voltage: {TARGET_VOLTAGE} V")
+    print(f"Maximum Resistor Heat Dissipation: {MAX_RESISTOR_HEAT} W")
     print(f"Valid resistor combinations for E{RESISTOR_E_SERIES} series:")
-    printed_combos = set()
-    for combo in valid_combos:
-        combo_tuple = (combo["R1"], combo["R2"])
-        if combo_tuple not in printed_combos:
-            output_str = [
-                f"{combo['Output Voltage']:.3f}V",
-                f"({combo['Percent Error']:.2f}%)",
-                f"[{combo_tuple[0]}Ω + {combo_tuple[1]}Ω]E{combo['Common Mult']}",
-                f"({combo['Power Dissipation']:.3f}W)"
-            ]
-            print("\t".join(output_str))
-            printed_combos.add(combo_tuple)
+    print(df_display.to_string(index=False))
 
 
 def get_resistors_in_series(series: int) -> list:
